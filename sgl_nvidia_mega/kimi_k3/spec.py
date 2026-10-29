@@ -331,7 +331,8 @@ SPEC = MegakernelSpec(
             "moe_runner_backend": frozenset({"flashinfer_mxfp4"}),
             "flashinfer_mxfp4_moe_precision": frozenset({"default"}),
             "prefill_attention_backend": frozenset({"trtllm_mla"}),
-            "decode_attention_backend": frozenset({"trtllm_mla"}),
+            # cutedsl_mla keeps trtllm_mla's decode metadata
+            "decode_attention_backend": frozenset({"trtllm_mla", "cutedsl_mla"}),
             "page_size": frozenset({64}),
             "dp_size": frozenset({1}),
             "enable_unified_memory": frozenset({False}),
