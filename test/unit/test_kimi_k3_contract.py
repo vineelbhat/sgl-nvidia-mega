@@ -238,6 +238,22 @@ class TestKimiK3Contract(unittest.TestCase):
             any("93-layer" in reason for reason in _model_disable_reasons(model, None))
         )
 
+    def test_prepare_weights_coalesces_every_attention_layer(self):
+        from sgl_nvidia_mega.kimi_k3 import projection_storage, spec
+
+        mla, kda = SimpleNamespace(q_b_proj=object()), SimpleNamespace()
+        layers = [SimpleNamespace(self_attn=mla), SimpleNamespace(self_attn=kda)]
+        model = SimpleNamespace(
+            language_model=SimpleNamespace(model=SimpleNamespace(layers=layers))
+        )
+        with (
+            patch.object(projection_storage, "coalesce_mla_projection_storage") as m,
+            patch.object(projection_storage, "coalesce_kda_projection_storage") as k,
+        ):
+            spec.SPEC.prepare_weights(model, None)
+        m.assert_called_once_with(mla)
+        k.assert_called_once_with(kda)
+
     def test_frozen_payload_inventory_and_digest(self):
         import sgl_nvidia_mega
 

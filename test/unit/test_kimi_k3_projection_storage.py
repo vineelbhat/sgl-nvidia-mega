@@ -198,6 +198,26 @@ class TestProjectionStorage(unittest.TestCase):
             ),
         )
 
+    def test_kda_repoints_a_tail_held_as_a_non_persistent_buffer(self):
+        owner, layout = _attention(alias=True), _layout(alias=True)
+        owner.register_buffer("_tail", owner.__dict__.pop("_tail"), persistent=False)
+        keys_before = tuple(owner.state_dict())
+        root = storage._coalesce_projection_storage(owner, layout, device_type="cpu")
+        self.assertNotIn("_tail", owner.__dict__)
+        self.assertTrue(storage._same_view(owner._tail, root, row=4, rows=4, columns=4))
+        self.assertEqual(keys_before, tuple(owner.state_dict()))
+        self.assertIs(
+            storage._coalesce_projection_storage(owner, layout, device_type="cpu"),
+            root,
+        )
+
+    def test_kda_refuses_a_tail_registered_as_checkpoint_state(self):
+        owner, layout = _attention(alias=True), _layout(alias=True)
+        owner.register_buffer("_tail", owner.__dict__.pop("_tail"))
+        with self.assertRaisesRegex(ValueError, "'_tail' is registered"):
+            storage._coalesce_projection_storage(owner, layout, device_type="cpu")
+        self.assertNotIn(storage._STORAGE_ATTR, owner.__dict__)
+
     def test_invalid_component_fails_before_mutating_parameters(self):
         owner, layout = _attention(alias=False), _layout(alias=False)
         owner.small_a.weight.data = owner.small_a.weight.data.to(torch.float64)

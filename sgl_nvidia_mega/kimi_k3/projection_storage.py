@@ -91,6 +91,19 @@ def _registered(owner: Any, name: str) -> bool:
     )
 
 
+def _alias(owner: Any, name: str) -> Any:
+    if name in owner._buffers:
+        return owner._buffers[name]
+    return owner.__dict__.get(name, _MISSING)
+
+
+def _set_alias(owner: Any, name: str, value: torch.Tensor) -> None:
+    if name in owner._buffers:
+        owner._buffers[name] = value
+    else:
+        owner.__dict__[name] = value
+
+
 def _validate_layout(layout: _Layout) -> None:
     if not layout.name or not layout.parts:
         raise ValueError("projection layout needs a name and at least one part")
@@ -184,11 +197,15 @@ def _validate_alias(
 ) -> None:
     if layout.alias_name is None:
         return
-    if _registered(owner, layout.alias_name):
+    # A loader that publishes weights to peers may hold it as a non-persistent buffer.
+    if (
+        _registered(owner, layout.alias_name)
+        and layout.alias_name not in owner._non_persistent_buffers_set
+    ):
         raise ValueError(
             f"{layout.name} projection alias {layout.alias_name!r} is registered"
         )
-    alias = owner.__dict__.get(layout.alias_name, _MISSING)
+    alias = _alias(owner, layout.alias_name)
     if not isinstance(alias, torch.Tensor):
         raise TypeError(
             f"{layout.name} projection alias {layout.alias_name!r} is absent"
@@ -304,9 +321,7 @@ def _coalesce_projection_storage(
 
     original_data = tuple(parameter.data for parameter in parameters)
     original_alias = (
-        owner.__dict__.get(layout.alias_name, _MISSING)
-        if layout.alias_name is not None
-        else _MISSING
+        _alias(owner, layout.alias_name) if layout.alias_name is not None else _MISSING
     )
     try:
         row = 0
@@ -314,7 +329,7 @@ def _coalesce_projection_storage(
             parameter.data = root[row : row + part.rows]
             row += part.rows
         if layout.alias_name is not None:
-            owner.__dict__[layout.alias_name] = root[_alias_start_row(layout) :]
+            _set_alias(owner, layout.alias_name, root[_alias_start_row(layout) :])
         # This is derived runtime storage, not checkpoint state.  Bypass
         # nn.Module.__setattr__ so it cannot become a parameter or buffer.
         owner.__dict__[_STORAGE_ATTR] = root
@@ -327,7 +342,7 @@ def _coalesce_projection_storage(
             if original_alias is _MISSING:
                 owner.__dict__.pop(layout.alias_name, None)
             else:
-                owner.__dict__[layout.alias_name] = original_alias
+                _set_alias(owner, layout.alias_name, original_alias)
         raise
     return root
 

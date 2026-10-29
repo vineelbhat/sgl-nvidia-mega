@@ -318,6 +318,22 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
     return _Built(model, resources, widths)
 
 
+def _prepare_weights(model: Any, hf_config: Any) -> None:
+    """Coalesce every layer's projection storage while weights load, so the build
+    reuses it and a loader that keeps the loaded tensors holds no second copy."""
+    from .projection_storage import (
+        coalesce_kda_projection_storage,
+        coalesce_mla_projection_storage,
+    )
+
+    for layer in model.language_model.model.layers:
+        attention = layer.self_attn
+        if hasattr(attention, "q_b_proj"):
+            coalesce_mla_projection_storage(attention)
+        else:
+            coalesce_kda_projection_storage(attention)
+
+
 SPEC = MegakernelSpec(
     name="Kimi K3 packed-MXFP4",
     requires=Requirements(
@@ -350,6 +366,7 @@ SPEC = MegakernelSpec(
     max_rows=max(WIDTHS),
     build=_build,
     prepare=_prepare,
+    prepare_weights=_prepare_weights,
     api_version=REQUIRED_MEGAKERNEL_API_VERSION,
     model_disable_reasons=_model_disable_reasons,
     config_disable_reasons=_config_disable_reasons,
