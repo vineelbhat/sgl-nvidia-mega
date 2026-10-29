@@ -56,8 +56,9 @@ class PreparedAttnRes:
 
     def _compile(self, slots, cap, aux=False, capture=False):
         arch = architecture(self.device)
-        key = (*self.key, slots, cap, arch, self.deadline_ns, aux, capture)
-        return compile_consumer(*key)
+        return compile_consumer(
+            *self.key, slots, cap, arch, self.deadline_ns, aux, capture
+        )
 
     @classmethod
     def for_target(cls, target, *, deadline_ns, final=False, has_delta=True):

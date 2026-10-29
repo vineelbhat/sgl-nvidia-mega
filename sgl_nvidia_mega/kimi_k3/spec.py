@@ -287,11 +287,12 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
 
 
 def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
-    from .providers import step_batches
-
     tokens = int(context.tokens_per_request)
     if not 1 <= tokens <= 8:
         raise ValueError(f"Kimi K3 megakernel verifies 2-8 tokens, not {tokens}")
+    deadline_ns = _deadline_ns(context.deadline_s)
+    from .providers import step_batches
+
     served = step_batches(tokens) if tokens > 1 else WIDTHS
     widths = tuple(
         width for width in context.widths if width in served and width % tokens == 0
@@ -302,7 +303,6 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
         )
     if context.binding is None:
         raise ValueError("Kimi K3 megakernel received no SGLang runtime binding")
-    deadline_ns = _deadline_ns(context.deadline_s)
     from .compat import validate_runtime_compatibility
 
     validate_runtime_compatibility()
