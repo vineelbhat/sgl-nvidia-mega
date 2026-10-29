@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 from sglang.srt.megakernels.spec import (
     BuildContext,
     BuiltMegakernel,
@@ -101,8 +102,16 @@ def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
     graph_config = cfg.cuda_graph_config
     if graph_config is None or graph_config.decode.backend != "full":
         reasons.append("needs the FULL decode CUDA-graph backend")
-    if int(cfg.context_length or 0) != 8192:
-        reasons.append("initial Kimi K3 coverage requires context length 8192")
+    algorithm = cfg.speculative_algorithm
+    if algorithm is not None:
+        if str(algorithm).upper() != "DFLASH":
+            reasons.append(f"speculative algorithm {algorithm} is not DFLASH")
+        if not cfg.enable_linear_replayssm_spec:
+            reasons.append("speculative verify needs --enable-linear-replayssm-spec")
+        if (cfg.speculative_eagle_topk or 1) != 1:
+            reasons.append("speculative verify needs a linear draft chain (topk 1)")
+        if not 2 <= int(cfg.speculative_num_draft_tokens or 0) <= 8:
+            reasons.append("speculative verify needs 2-8 draft tokens per request")
     return reasons
 
 
@@ -155,12 +164,44 @@ class _Built:
         self.language_model = model.language_model
         self.resources = resources
         self.widths = widths
+        self.tokens = int(resources.tokens)
         self.executor = KimiK3MegakernelExecutor(resources)
         # Local validation observers read this without changing the public API.
         model.__dict__["_nvidia_kimi_k3_megakernel"] = self
 
     def summary(self) -> str:
+        if self.tokens > 1:
+            requests = [width // self.tokens for width in self.widths]
+            return (
+                f"TP8 {self.tokens}-token verify of {requests[0]}-{requests[-1]} "
+                "requests"
+            )
         return "TP8 one-token decode at rows 1-8, 16, 32, and 64"
+
+    def capture_layers(self) -> tuple[int, ...]:
+        """The layers whose input mixture DFlash captures, in its column order."""
+        layers = self.language_model.model.dspark_layers_to_capture or ()
+        return tuple(int(layer) + 1 for layer in layers)
+
+    def _captures(self, forward_batch: Any, rows: int) -> tuple[dict, Any]:
+        layers = self.capture_layers()
+        if not layers:
+            return {}, None
+        buffer = getattr(forward_batch, "aux_hidden_states_buffer", None)
+        width = 7168 * len(layers)
+        if buffer is None:
+            buffer = self.resources.scratch["aux"]
+        if tuple(buffer.shape[1:]) != (width,) or buffer.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"Kimi K3 megakernel aux buffer {tuple(buffer.shape)} {buffer.dtype} "
+                f"does not take {len(layers)} captures"
+            )
+        buffer = buffer[:rows]
+        captures = {
+            layer: buffer[:, 7168 * k : 7168 * (k + 1)]
+            for k, layer in enumerate(layers)
+        }
+        return captures, buffer
 
     def plan(
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
@@ -171,7 +212,20 @@ class _Built:
             return None
         mode = forward_batch.forward_mode
         rows = int(input_ids.shape[0])
-        if not mode.is_decode() or rows not in self.widths:
+        if rows not in self.widths:
+            return None
+        if self.tokens > 1:
+            spec_info = forward_batch.spec_info
+            if not mode.is_target_verify() or spec_info is None:
+                return None
+            if int(getattr(spec_info, "draft_token_num", 0)) != self.tokens:
+                return None
+            if getattr(spec_info, "ragged_verify_layout", None) is not None:
+                return None
+            if int(forward_batch.batch_size) * self.tokens != rows:
+                return None
+            return Step(mode="target_verify", rows=rows)
+        if not mode.is_decode():
             return None
         if int(forward_batch.batch_size) != rows:
             return None
@@ -189,33 +243,59 @@ class _Built:
     ) -> Any:
         if get_embedding or pp_proxy_tensors is not None:
             raise RuntimeError("Kimi K3 megakernel received an unplanned model call")
-        if step.mode != "decode" or step.rows not in self.widths:
+        mode = "target_verify" if self.tokens > 1 else "decode"
+        if step.mode != mode or step.rows not in self.widths:
             raise RuntimeError(f"unsupported Kimi K3 megakernel step: {step}")
-        if int(forward_batch.batch_size) != step.rows:
+        if int(forward_batch.batch_size) * self.tokens != step.rows:
             raise RuntimeError("Kimi K3 megakernel plan and forward batch disagree")
         if step.view is None or step.view.hybrid is None:
             raise RuntimeError("Kimi K3 megakernel received no typed hybrid step view")
-        hidden_states = self.executor.run(input_ids, None, step.view.hybrid)
+        captures, aux = self._captures(forward_batch, step.rows)
+        hidden_states = self.executor.run(
+            input_ids, None, step.view.hybrid, tokens=self.tokens, captures=captures
+        )
         return self.language_model.logits_processor(
             input_ids,
             hidden_states,
             self.language_model.lm_head,
             forward_batch,
-            None,
+            aux,
         )
 
 
 def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
-    """Bind typed SGLang-owned pools after allocation, before graph warmup."""
+    """Bind typed SGLang-owned pools after allocation, before graph warmup, and
+    compile the AttnRes variants of the layers DFlash captures."""
     if view.hybrid is None:
         raise ValueError("Kimi K3 megakernel requires a hybrid MLA/KDA pool")
-    cast(_Built, built).resources.bind(view.hybrid)
+    built = cast(_Built, built)
+    resources = built.resources
+    resources.bind(view.hybrid)
+    layers = built.capture_layers()
+    if any(layer >= 93 for layer in layers):
+        raise ValueError("Kimi K3 megakernel cannot capture the final norm's input")
+    for layer in layers:
+        consumer = resources.before[layer]
+        if consumer.capture is None:
+            consumer.bind_capture()
+    if layers and "aux" not in resources.scratch:
+        device = resources.scratch["hidden.0"].device
+        width = 7168 * len(layers)
+        resources.scratch["aux"] = torch.empty(
+            (max(resources.batches), width), dtype=torch.bfloat16, device=device
+        )
 
 
 def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
-    if context.tokens_per_request != 1:
-        raise ValueError("Kimi K3 megakernel serves one-token decode only")
-    widths = tuple(width for width in context.widths if width in WIDTHS)
+    from .providers import step_batches
+
+    tokens = int(context.tokens_per_request)
+    if not 1 <= tokens <= 8:
+        raise ValueError(f"Kimi K3 megakernel verifies 2-8 tokens, not {tokens}")
+    served = step_batches(tokens) if tokens > 1 else WIDTHS
+    widths = tuple(
+        width for width in context.widths if width in served and width % tokens == 0
+    )
     if not widths:
         raise ValueError(
             f"Kimi K3 megakernel found no supported width in {list(context.widths)}"
@@ -233,6 +313,7 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
         context_length=int(get_model().context_length),
         memory_before=_cuda_memory(),
         deadline_ns=deadline_ns,
+        tokens=tokens,
     )
     return _Built(model, resources, widths)
 
@@ -258,7 +339,7 @@ SPEC = MegakernelSpec(
         },
         hf_config={"language_only": True, "encoder_only": False},
     ),
-    features=frozenset({Feature.MULTI_NODE_TP}),
+    features=frozenset({Feature.MULTI_NODE_TP, Feature.SPECULATIVE_DECODING}),
     numerics=Numerics(
         kind=NumericsKind.TOLERANCE,
         tolerances={"forward.selected_logprobs.max_abs": 0.5},

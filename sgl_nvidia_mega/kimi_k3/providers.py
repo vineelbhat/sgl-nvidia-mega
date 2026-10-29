@@ -14,6 +14,7 @@ import importlib
 import inspect
 import json
 import math
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,19 @@ from .projection_storage import (
 PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
 _BATCHES = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 _MAX_BATCH = max(_BATCHES)
+
+
+def step_batches(tokens: int) -> tuple[int, ...]:
+    """Rows of every step served: the decode batches, or with ``tokens`` > 1 each whole
+    number of ``tokens``-row verify requests up to the widest decode batch (a
+    speculative target never decodes)."""
+    if tokens > 1:
+        return tuple(range(tokens, _MAX_BATCH + 1, tokens))
+    return _BATCHES
+
+
+def _bin(batch: int) -> int:
+    return next(b for b in (8, 16, 32, 64) if batch <= b)
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
@@ -425,6 +439,8 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    tokens: int = 1
+    batches: tuple[int, ...] = _BATCHES
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
@@ -501,6 +517,16 @@ class ResourceSet:
         kda_capacity = int(hybrid.kda.capacity)
         if kda_capacity <= 0:
             raise ValueError("Kimi K3 KDA state capacity is empty")
+        first_state = hybrid.kda.state(linear_ids[0])
+        temporal_dtype = first_state.temporal.dtype
+        if temporal_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(f"unsupported KDA temporal dtype: {temporal_dtype}")
+        if self.tokens > 1 and (
+            first_state.ring is None or first_state.conv_window is None
+        ):
+            raise ValueError(
+                "Kimi K3 megakernel verify needs --enable-linear-replayssm-spec"
+            )
 
         first_cache = hybrid.mla.cache(full_ids[0])
         first_parameter = next(iter(self.model.parameters()), None)
@@ -556,11 +582,13 @@ class ResourceSet:
             _validate_pool_tensor(
                 f"layer {layer_id} KDA temporal state",
                 temporal_view,
-                dtype=torch.float32,
+                dtype=temporal_dtype,
                 shape=expected_temporal_shape,
                 stride=(12 * 128 * 128, 128 * 128, 128, 1),
                 device=device,
             )
+            if self.tokens > 1:
+                self._validate_verify_scratch(layer_id, state, device)
             local_identities[f"kda_conv.{layer_id}"] = int(conv_view.data_ptr())
             local_identities[f"kda_temporal.{layer_id}"] = int(temporal_view.data_ptr())
             local_layouts.extend(
@@ -604,6 +632,36 @@ class ResourceSet:
         }
         return binding
 
+    def _validate_verify_scratch(self, layer_id: int, state: Any, device) -> None:
+        q, ring, window = self.tokens, state.ring, state.conv_window
+        rows = int(window.shape[0])
+        _validate_pool_tensor(
+            f"layer {layer_id} KDA conv windows",
+            window,
+            dtype=torch.bfloat16,
+            shape=(rows, q, 3, 4608),
+            stride=(q * 3 * 4608, 3 * 4608, 4608, 1),
+            device=device,
+        )
+        slots, length = int(ring.rawv.shape[0]), int(ring.rawv.shape[2])
+        if length < q:
+            raise ValueError(f"KDA ReplaySSM ring length {length} < {q} tokens")
+        for name, value, dtype, shape in (
+            ("raw v", ring.rawv, torch.bfloat16, (slots, 12, length, 128)),
+            ("raw k", ring.rawk, torch.bfloat16, (slots, 12, length, 128)),
+            ("log-decay", ring.g, torch.float32, (slots, 12, length, 128)),
+            ("beta", ring.beta, torch.float32, (slots, 12, length)),
+        ):
+            stride = tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
+            _validate_pool_tensor(
+                f"layer {layer_id} KDA ring {name}",
+                value,
+                dtype=dtype,
+                shape=shape,
+                stride=stride,
+                device=device,
+            )
+
     def bind(self, hybrid: HybridPoolView) -> None:
         candidate = self._binding_candidate(hybrid)
         fingerprint = _digest(candidate)
@@ -621,7 +679,13 @@ class ResourceSet:
             else:
                 state = hybrid.kda.state(layer_id)
                 caches = (state.conv[0], state.temporal)
-                provider.core.prepare_caches(caches)
+                if self.tokens > 1:
+                    rows = torch.empty(_MAX_BATCH, dtype=torch.int32, device="meta")
+                    ring = state.ring
+                    rings = (ring.rawv, ring.rawk, ring.g, ring.beta)
+                    provider.core.prepare_ring(caches, state.conv_window, rings, rows)
+                else:
+                    provider.core.prepare_caches(caches)
                 provider.caches = caches
             self.compilation_inventory.append(
                 {"kind": "attention_core", "layer_id": layer_id, "name": provider.kind}
@@ -641,10 +705,14 @@ def build_resources(
     context_length: int,
     memory_before: dict[str, int],
     deadline_ns: int,
+    tokens: int = 1,
 ) -> ResourceSet:
-    """Build every frozen TP8/B1-B8/B16/B32/B64 provider after all-rank consensus."""
+    """Build every frozen TP8 provider after all-rank consensus: decode batches
+    B1-B8/B16/B32/B64, and with ``tokens`` > 1 each verify step of whole requests."""
 
     memory_before = dict(memory_before)
+    batches = step_batches(tokens)
+    verify = tuple(b // tokens for b in batches if tokens > 1 and b % tokens == 0)
     origins: dict[str, str] = {}
     projection_module = _module("gemm.projection", origins)
     mla_module = _module("mla.prepared", origins)
@@ -702,7 +770,7 @@ def build_resources(
         "small_batch": small_box,
         "moe_tail": tail_box,
     }
-    moe_state = prepared_moe_module.MoEScratch(tp, device, _BATCHES)
+    moe_state = prepared_moe_module.MoEScratch(tp, device, batches)
     # Materialize the state-owned event handles before resource inventory.  The
     # prepared MoE records them again at each execution boundary, so completing
     # an initialization record on its own stream does not alter runtime order.
@@ -772,24 +840,26 @@ def build_resources(
                 {
                     batch: (
                         (64, 64, 2, 5)
-                        if batch == 64
+                        if _bin(batch) == 64
                         else (64, 32, 2, 8)
-                        if batch == 32
+                        if _bin(batch) == 32
                         else (64, 16, 2, 10)
-                        if batch == 16
+                        if _bin(batch) == 16
                         else (64, 8, 4, 8)
                     )
-                    for batch in _BATCHES
+                    for batch in batches
                 },
             ).prepare()
             core = mla_module.PreparedMla(
                 proxy,
-                {batch: 3648 for batch in _BATCHES},
+                {batch: 3648 for batch in batches},
                 scratch["mla.query"],
                 max_context=int(context_length),
-                core="trtllm",
+                core=os.environ.get(
+                    "SGL_NVIDIA_MEGA_K3_MLA_CORE", "trtllm" if tokens == 1 else "auto"
+                ),
                 dcp=None,
-                queries=(1,),
+                queries=(tokens,),
             )
             if not workspaces:
                 workspace, counter = _prepare_mla_workspace(
@@ -813,27 +883,28 @@ def build_resources(
                 {
                     batch: (
                         (64, 64, 1, 6)
-                        if batch == 64
+                        if _bin(batch) == 64
                         else (128, 32, 2, 5)
-                        if batch == 32
+                        if _bin(batch) == 32
                         else (128, 16, 2, 6)
-                        if batch == 16
+                        if _bin(batch) == 16
                         else (128, 8, 2, 6)
                     )
-                    for batch in _BATCHES
+                    for batch in batches
                 },
             ).prepare()
-            core = kda_module.PreparedKda(
-                proxy,
-                {
+            policies: dict[Any, tuple[int, int]] = {}
+            if tokens > 1:  # verify steps only: SGLang's target never decodes
+                policies = {(requests, tokens): (6288, 1) for requests in verify}
+            else:
+                policies = {
                     batch: (
                         6288,
                         0 if batch in (16, 32, 64) else 1 if batch == 1 else 2,
                     )
                     for batch in _BATCHES
-                },
-                False,
-            )
+                }
+            core = kda_module.PreparedKda(proxy, policies, False)
             kind = "kda"
 
         front = None
@@ -847,7 +918,7 @@ def build_resources(
         output = oproj_module.PreparedOproj(
             layer,
             mailbox,
-            _BATCHES,
+            batches,
             is_mla,
             front,
             oproj_twoshot,
@@ -866,7 +937,7 @@ def build_resources(
         if not layer._is_moe_layer:
             feed_forward[layer_id] = dense_module.PreparedDenseMLP(
                 layer.mlp,
-                _BATCHES,
+                batches,
                 reduce=tensor_model_parallel_all_reduce,
             )
             compilation.append(
@@ -894,7 +965,7 @@ def build_resources(
             op,
             layer.mlp.routed_expert_norm.weight,
             layer.mlp.routed_expert_up_proj.weight,
-            _BATCHES,
+            batches,
             (tail_box, ordinal, len(moe_layers)),
             deadline_ns=deadline_ns,
         )
@@ -918,12 +989,12 @@ def build_resources(
             packed_front,
             front_box,
             moe_state.front,
-            _BATCHES,
+            batches,
             beta,
             linear_beta,
             plan=moe_state.plan,
             counters=moe_state.shared,
-            q=1,
+            q=tokens,
             deadline_ns=deadline_ns,
         )
         chain = chain_module.SmallBatchChain(
@@ -1008,6 +1079,8 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        tokens=tokens,
+        batches=batches,
     )
     resources.refresh_inventory()
     return resources

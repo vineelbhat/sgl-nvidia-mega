@@ -29,7 +29,7 @@ SPEC_SCHEDULE = {
 
 
 @cache
-def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
+def executable(specs, heads, gate_mode, has_bias, device, tokens=1, ring=False):
     args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
     batch = specs[0][0][0]
     table = SCHEDULE if tokens == 1 else SPEC_SCHEDULE
@@ -38,7 +38,12 @@ def executable(specs, heads, gate_mode, has_bias, device, tokens=1):
     if schedule[0] >= 2 and specs[9][1][-2:] != (128, 1):  # staging needs whole rows
         schedule = (1, *schedule[1:4])  # no evict hint without staging
     requests = batch // tokens
-    kernel = KdaSplit(heads, requests, gate_mode, has_bias, schedule, tokens)
+    state_bf16 = specs[9][2] == torch.bfloat16
+    if state_bf16 and schedule[0] >= 2:
+        schedule = (1, *schedule[1:4])
+    kernel = KdaSplit(
+        heads, requests, gate_mode, has_bias, schedule, tokens, ring, state_bf16
+    )
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
     with torch.accelerator.device_index(device):
         return cute.compile(
@@ -67,9 +72,10 @@ class PreparedKda:
         self.scalars = tuple(map(cutlass.Float32, scalars))
         self.conv_dim_first, self.kernels = conv_dim_first, {}
 
-    def _operands(self, caches, projected, slots, out, accepted=None):
+    def _operands(self, caches, projected, slots, out, accepted=None, ring=None):
         """Kernel tensors in launch order: 13 before the scalars, then F_B (and the
-        verify step's accepted counts)."""
+        verify step's accepted counts, or ``ring``: its rows, conv windows and the
+        four ReplaySSM rings)."""
         conv, state = caches[:2]
         conv = conv if self.conv_dim_first else conv.transpose(-1, -2)
         w, bias, fb, a_log, dt, norm = self.weights
@@ -77,7 +83,40 @@ class PreparedKda:
         p = lambda start, width: projected[:, start : start + width]
         ops = (p(0, 3 * d), w, bias, conv, p(4 * d, 128), p(4 * d + 128, h), a_log, dt)
         tail = (fb,) if accepted is None else (fb, accepted)
+        if ring is not None:
+            tail = (fb, *ring)
         return ops + (slots, state, out, p(3 * d, d), norm) + tail
+
+    def prepare_ring(self, caches, window, rings, rows):
+        """SGLang's ReplaySSM verify (``ring`` contract) for every (requests, tokens)
+        policy: committed ``caches``, the conv ``window`` scratch [rows, q, 3, dim],
+        ``rings`` (raw v, raw k, log-decay, beta) and the verify ``rows`` table."""
+        self.ring = (window, *rings)
+        for key, (pitch, mode) in self.policies.items():
+            requests, tokens = key
+            batch, meta = requests * tokens, dict(device="meta")
+            projected = torch.empty((batch, pitch), dtype=torch.bfloat16, **meta)
+            out = torch.empty(batch, self.dim, dtype=torch.bfloat16, **meta)
+            slots = torch.empty(requests, dtype=torch.int32, **meta)
+            operands = self._operands(
+                caches, projected, slots, out, ring=(rows[:requests], *self.ring)
+            )
+            self.kernels[key] = executable(
+                tuple(map(layout, operands)),
+                *(self.heads, mode, self.has_bias, self.device.index, tokens, True),
+            )
+        return self
+
+    def run_ring(self, projected, out, *, caches, slots, rows, tokens):
+        """A verify step of ``tokens`` rows per request under the ``ring`` contract:
+        ``slots`` [>= B] committed state slots, ``rows`` [>= B] window rows."""
+        requests = projected.shape[0] // tokens
+        ring = (rows[:requests], *self.ring)
+        tensors = self._operands(caches, projected, slots[:requests], out, ring=ring)
+        views = tuple(to_cute(t, 16) for t in tensors)
+        kernel = self.kernels[requests, tokens]
+        kernel(*views[:13], *self.scalars, *views[13:], stream(self.device))
+        return out
 
     def prepare_caches(self, caches):
         """Policy keys: a batch, or (requests, tokens) for verify steps."""
