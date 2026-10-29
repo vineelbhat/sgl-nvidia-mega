@@ -212,7 +212,7 @@ class _Built:
             return None
         mode = forward_batch.forward_mode
         rows = int(input_ids.shape[0])
-        if rows not in self.widths:
+        if rows not in self.widths or forward_batch.contains_mm_inputs():
             return None
         if self.tokens > 1:
             spec_info = forward_batch.spec_info
@@ -337,9 +337,11 @@ SPEC = MegakernelSpec(
             "enable_unified_memory": frozenset({False}),
             "enable_page_major_kv_layout": frozenset({False}),
         },
-        hf_config={"language_only": True, "encoder_only": False},
+        hf_config={"encoder_only": False},
     ),
-    features=frozenset({Feature.MULTI_NODE_TP, Feature.SPECULATIVE_DECODING}),
+    features=frozenset(
+        {Feature.MULTI_NODE_TP, Feature.SPECULATIVE_DECODING, Feature.KV_OFFLOAD}
+    ),
     numerics=Numerics(
         kind=NumericsKind.TOLERANCE,
         tolerances={"forward.selected_logprobs.max_abs": 0.5},
