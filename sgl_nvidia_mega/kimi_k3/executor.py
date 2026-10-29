@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""TP8/B1-B8/B16/B32/B64 captured-decode executor for Kimi K3."""
+"""TP8 captured-decode and speculative-verify executor for Kimi K3."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ SGLANG_READS = {
         "sequence_lengths",
         "state_indices",
         "track_decode_state",
+        "verify_rows",
         "write_slots",
     ),
 }
@@ -63,7 +64,9 @@ def _validate_step_inputs(
     *,
     batch: int,
     device: torch.device,
+    tokens: int = 1,
 ) -> None:
+    requests = batch // tokens
     if device.type != "cuda":
         raise RuntimeError(
             f"Kimi K3 megakernel execution requires CUDA resources, found {device}"
@@ -97,7 +100,7 @@ def _validate_step_inputs(
         "MLA sequence lengths",
         view.mla.sequence_lengths,
         dtype=torch.int32,
-        shape=(batch,),
+        shape=(requests,),
         device=device,
         strides=(1,),
     )
@@ -105,10 +108,24 @@ def _validate_step_inputs(
         "KDA state indices",
         view.kda.state_indices,
         dtype=torch.int32,
-        shape=(batch,),
+        shape=(requests,),
         device=device,
         strides=(1,),
     )
+    if tokens > 1:
+        rows = view.kda.verify_rows
+        if not isinstance(rows, torch.Tensor) or rows.dtype != torch.int32:
+            raise RuntimeError("Kimi K3 megakernel verify rows are not an int32 tensor")
+        if rows.dim() != 1 or int(rows.shape[0]) < requests or rows.device != device:
+            raise RuntimeError(
+                f"Kimi K3 megakernel verify rows {tuple(rows.shape)} on {rows.device} "
+                f"do not cover {requests} requests on {device}"
+            )
+        if view.kda.draft_tokens != tokens:
+            raise RuntimeError(
+                f"Kimi K3 megakernel verifies {tokens} tokens per request, the step "
+                f"drafts {view.kda.draft_tokens}"
+            )
     table = view.mla.block_table
     if not isinstance(table, torch.Tensor):
         raise RuntimeError("Kimi K3 megakernel MLA block table is not a tensor")
@@ -117,10 +134,10 @@ def _validate_step_inputs(
             "Kimi K3 megakernel MLA block table must be int32 on "
             f"{device}, found {table.dtype} on {table.device}"
         )
-    if table.dim() != 2 or int(table.shape[0]) != batch or int(table.shape[1]) <= 0:
+    if table.dim() != 2 or int(table.shape[0]) != requests or int(table.shape[1]) <= 0:
         raise RuntimeError(
             "Kimi K3 megakernel MLA block table must be a nonempty "
-            f"[{batch}, pages] tensor, found {tuple(table.shape)}"
+            f"[{requests}, pages] tensor, found {tuple(table.shape)}"
         )
     rows, columns = int(table.stride(0)), int(table.stride(1))
     if columns != 1 or rows < int(table.shape[1]):
@@ -141,8 +158,14 @@ class KimiK3MegakernelExecutor:
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None,
         view: HybridStepView,
+        *,
+        tokens: int = 1,
+        captures: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """``tokens`` rows per request, a verify step when > 1. ``captures`` maps a layer
+        to the [rows, 7168] view that takes the pre-norm mixture its input reads."""
         resources = self.resources
+        captures = captures or {}
         if resources.binding_fingerprint is None:
             raise RuntimeError(
                 "Kimi K3 megakernel pools were not bound before graph warmup"
@@ -150,7 +173,7 @@ class KimiK3MegakernelExecutor:
         mla_slots = view.mla.write_slots
         kda_slots = view.kda.state_indices
         batch = int(input_ids.shape[0])
-        if batch not in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64):
+        if batch not in resources.batches or batch % tokens:
             raise RuntimeError(f"unsupported Kimi K3 megakernel batch: {batch}")
         device = resources.scratch["hidden.0"].device
         _validate_step_inputs(
@@ -159,6 +182,7 @@ class KimiK3MegakernelExecutor:
             view,
             batch=batch,
             device=device,
+            tokens=tokens,
         )
         for layer_id, attention in resources.attention.items():
             if attention.kind == "mla" and attention.cache is None:
@@ -189,7 +213,9 @@ class KimiK3MegakernelExecutor:
             layer_id = int(layer.layer_idx)
             last_layer_id = layer_id
             if not next_input_ready:
-                resources.before[layer_id].run(hidden, prefix, blocks, first)
+                resources.before[layer_id].run(
+                    hidden, prefix, blocks, first, capture=captures.get(layer_id)
+                )
 
             attention = resources.attention[layer_id]
             projected = mla_projected if attention.kind == "mla" else kda_projected
@@ -202,6 +228,16 @@ class KimiK3MegakernelExecutor:
                     slots=mla_slots,
                     block_table=view.mla.block_table,
                     lengths=view.mla.sequence_lengths,
+                    q=tokens,
+                )
+            elif tokens > 1:
+                attention.core.run_ring(
+                    projected,
+                    local,
+                    caches=attention.caches,
+                    slots=kda_slots,
+                    rows=view.kda.verify_rows,
+                    tokens=tokens,
                 )
             else:
                 attention.core.run(
@@ -215,7 +251,8 @@ class KimiK3MegakernelExecutor:
             feed_forward = resources.feed_forward[layer_id]
             if consumer is not None:
                 target = output if consumer is resources.final else first
-                consume = partial(consumer.run_ring, prefix, blocks)
+                capture = captures.get(layer_id + 1)
+                consume = partial(consumer.run_ring, prefix, blocks, capture=capture)
                 hidden = feed_forward.run(second, target, consume=consume)
             else:
                 hidden = feed_forward.run(second, first)

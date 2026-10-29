@@ -16,7 +16,7 @@ import torch
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 FROZEN_PAYLOAD_SHA256 = (
-    "c3fde49433b5a43efd9cd75f68db1ce09d41581506492938a29664255d6327c2"
+    "f2ba000ec73e4373b870c30d27f93f129364fbfffaa4f96096e72e938734db6b"
 )
 
 
@@ -29,7 +29,11 @@ class _Mode:
 
 
 def _batch(mode: str, batch_size: int):
-    return SimpleNamespace(forward_mode=_Mode(mode), batch_size=batch_size)
+    return SimpleNamespace(
+        forward_mode=_Mode(mode),
+        batch_size=batch_size,
+        contains_mm_inputs=lambda: False,
+    )
 
 
 class TestKimiK3Contract(unittest.TestCase):
@@ -59,10 +63,19 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertEqual(MEGAKERNEL_API_VERSION, 1)
         self.assertEqual(SPEC.requires.isas, frozenset({"sm_103"}))
         self.assertEqual(SPEC.requires.tp_sizes, frozenset({8}))
-        self.assertEqual(SPEC.requires.resident_blocks, 152)
+        self.assertEqual(SPEC.requires.resident_blocks, 148)
         self.assertEqual(SPEC.requires.dtypes, frozenset({"bfloat16"}))
         self.assertEqual(SPEC.requires.decode_graph_backends, frozenset({"full"}))
-        self.assertEqual(SPEC.features, frozenset({Feature.MULTI_NODE_TP}))
+        self.assertEqual(
+            SPEC.features,
+            frozenset(
+                {
+                    Feature.MULTI_NODE_TP,
+                    Feature.SPECULATIVE_DECODING,
+                    Feature.KV_OFFLOAD,
+                }
+            ),
+        )
         self.assertEqual(SPEC.max_rows, 64)
         self.assertIsNotNone(SPEC.prepare)
         self.assertEqual(
@@ -72,17 +85,14 @@ class TestKimiK3Contract(unittest.TestCase):
                 "moe_runner_backend": frozenset({"flashinfer_mxfp4"}),
                 "flashinfer_mxfp4_moe_precision": frozenset({"default"}),
                 "prefill_attention_backend": frozenset({"trtllm_mla"}),
-                "decode_attention_backend": frozenset({"trtllm_mla"}),
+                "decode_attention_backend": frozenset({"trtllm_mla", "cutedsl_mla"}),
                 "page_size": frozenset({64}),
                 "dp_size": frozenset({1}),
                 "enable_unified_memory": frozenset({False}),
                 "enable_page_major_kv_layout": frozenset({False}),
             },
         )
-        self.assertEqual(
-            SPEC.requires.hf_config,
-            {"language_only": True, "encoder_only": False},
-        )
+        self.assertEqual(SPEC.requires.hf_config, {"encoder_only": False})
         self.assertEqual(SPEC.numerics.kind, NumericsKind.TOLERANCE)
         self.assertEqual(
             SPEC.numerics.tolerances,
@@ -136,7 +146,7 @@ class TestKimiK3Contract(unittest.TestCase):
             deadline_s=30.0,
             binding=object(),
         )
-        resources = object()
+        resources = SimpleNamespace(tokens=1)
         with (
             patch.object(
                 compat,
@@ -164,6 +174,7 @@ class TestKimiK3Contract(unittest.TestCase):
             context_length=8192,
             memory_before={},
             deadline_ns=30_000_000_000,
+            tokens=1,
         )
 
     def test_exact_widths_plan_and_every_other_call_falls_back(self):
@@ -171,6 +182,7 @@ class TestKimiK3Contract(unittest.TestCase):
 
         built = object.__new__(_Built)
         built.widths = WIDTHS
+        built.tokens = 1
         for width in WIDTHS:
             step = built.plan(SimpleNamespace(shape=(width,)), _batch("decode", width))
             self.assertEqual((step.mode, step.rows), ("decode", width))
@@ -194,6 +206,9 @@ class TestKimiK3Contract(unittest.TestCase):
                         **kwargs,
                     )
                 )
+        image_batch = _batch("decode", 1)
+        image_batch.contains_mm_inputs = lambda: True
+        self.assertIsNone(built.plan(SimpleNamespace(shape=(1,)), image_batch))
 
     def test_configuration_and_loaded_model_refusals_are_named(self):
         from sgl_nvidia_mega.kimi_k3.spec import (
@@ -203,14 +218,20 @@ class TestKimiK3Contract(unittest.TestCase):
 
         cfg = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
-            context_length=8192,
+            speculative_algorithm="DFLASH",
+            enable_linear_replayssm_spec=True,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=8,
         )
         self.assertEqual(_config_disable_reasons(cfg, SimpleNamespace()), [])
-        cfg.context_length = 4096
         cfg.cuda_graph_config.decode.backend = "disabled"
+        cfg.speculative_algorithm = "EAGLE"
+        cfg.enable_linear_replayssm_spec = False
+        cfg.speculative_eagle_topk = 2
+        cfg.speculative_num_draft_tokens = 16
         reasons = _config_disable_reasons(cfg, SimpleNamespace())
-        self.assertTrue(any("FULL" in reason for reason in reasons))
-        self.assertTrue(any("8192" in reason for reason in reasons))
+        for needle in ("FULL", "not DFLASH", "replayssm-spec", "topk 1", "2-8 draft"):
+            self.assertTrue(any(needle in reason for reason in reasons), needle)
 
         class PackedMXFP4Method:
             pass
@@ -237,6 +258,22 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertTrue(
             any("93-layer" in reason for reason in _model_disable_reasons(model, None))
         )
+
+    def test_prepare_weights_coalesces_every_attention_layer(self):
+        from sgl_nvidia_mega.kimi_k3 import projection_storage, spec
+
+        mla, kda = SimpleNamespace(q_b_proj=object()), SimpleNamespace()
+        layers = [SimpleNamespace(self_attn=mla), SimpleNamespace(self_attn=kda)]
+        model = SimpleNamespace(
+            language_model=SimpleNamespace(model=SimpleNamespace(layers=layers))
+        )
+        with (
+            patch.object(projection_storage, "coalesce_mla_projection_storage") as m,
+            patch.object(projection_storage, "coalesce_kda_projection_storage") as k,
+        ):
+            spec.SPEC.prepare_weights(model, None)
+        m.assert_called_once_with(mla)
+        k.assert_called_once_with(kda)
 
     def test_frozen_payload_inventory_and_digest(self):
         import sgl_nvidia_mega
@@ -349,6 +386,9 @@ class TestKimiK3TypedBinding(unittest.TestCase):
 
         built = object.__new__(_Built)
         built.resources = resources
+        built.language_model = SimpleNamespace(
+            model=SimpleNamespace(dspark_layers_to_capture=None)
+        )
         memory = {
             key: 0
             for key in ("allocated", "reserved", "peak_allocated", "peak_reserved")
@@ -384,6 +424,9 @@ class TestKimiK3TypedBinding(unittest.TestCase):
 
         built = object.__new__(_Built)
         built.resources = resources
+        built.language_model = SimpleNamespace(
+            model=SimpleNamespace(dspark_layers_to_capture=None)
+        )
 
         memory = {
             key: 0
@@ -484,6 +527,7 @@ class TestKimiK3TypedStep(unittest.TestCase):
             fused_before={},
             feed_forward={index: _NoOp() for index in range(93)},
             final=_NoOp(),
+            batches=(batch,),
         )
         tracked = []
         view = HybridStepView(

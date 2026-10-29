@@ -116,6 +116,7 @@ class PersistentExperts:
         experts, rows, _ = w13.shape
         self.tp, self.grid = (8, 136) if rows == 768 else (16, 152)
         self.device, self.experts = w13.device, experts
+        self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.weights = (w13, s13, w2, s2)
         # TP8: B3-4 on 148 CTAs; B5-8 publish on 128-136 CTAs, leaving SMs for the
         # one-wave tail; grouped B9-64 on 152.
@@ -189,7 +190,7 @@ class PersistentExperts:
         code(tensor(ids), ws, c.Int32(ids.shape[0]), stream(self.device))
 
     def grid_for(self, batch):
-        return self.grids.get(batch, self.grid)
+        return min(self.grids.get(batch, self.grid), self.sms)
 
     def run(self, x, ids, weights=None):
         batch = x.shape[0]

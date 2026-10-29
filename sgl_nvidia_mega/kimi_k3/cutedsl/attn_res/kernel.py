@@ -79,9 +79,13 @@ class ClusterAttnRes:
         write=-1,
         final=False,
         deadline_ns=0,
+        capture=False,
     ):
         self.nb, self.slots, self.has_delta = nb, slots, has_delta
         self.write, self.final = write, final
+        # The last extra argument takes the pre-norm mixture (DFlash's aux capture).
+        self.capture = capture
+        assert not (capture and final)
         self.deadline_ns = deadline_ns
         self.npre = 2 * nb
         self.npost = (2 if final else 4) if nb else 1
@@ -248,8 +252,11 @@ class ClusterAttnRes:
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
         row = (words[0], words[1], words[2], words[3])
         store_words(at(prefix, token, col), row)
-        for stream_out in aux:
+        streams = aux[:-1] if self.capture else aux
+        for stream_out in streams:
             store_words(at(stream_out, token, col), row)
+        if cutlass.const_expr(self.capture and self.nb == 0):
+            store_words(at(aux[-1], token, col), row)
         if cutlass.const_expr(self.write >= 0):
             store_words(block_ptr(blocks, token, self.write, col), row)
         result = cute.make_rmem_tensor((1, 8), Float32)
@@ -286,6 +293,16 @@ class ClusterAttnRes:
                 ca, cp = alpha * scale, ep * scale
                 for i in cutlass.range_constexpr(8):
                     result[0, i] = fma(ca, mixture[0, i], cp * v[NEW, i]) * v[G, i]
+                if cutlass.const_expr(self.capture):
+                    inverse = Float32(1) / denominator
+                    mix = cute.make_rmem_tensor(4, Uint32)
+                    for j in cutlass.range_constexpr(4):
+                        pair = [
+                            fma(alpha * inverse, mixture[0, i], ep * inverse * v[NEW, i])
+                            for i in (2 * j, 2 * j + 1)
+                        ]
+                        mix[j] = bf16x2(pair[0], pair[1])
+                    store_words(at(aux[-1], token, col), tuple(mix[j] for j in range(4)))
         for j in cutlass.range_constexpr(4):
             words[j] = bf16x2(result[0, 2 * j], result[0, 2 * j + 1])
         store_words(at(output, token, col), tuple(words[j] for j in range(4)))

@@ -21,7 +21,9 @@ from .kernel import ClusterAttnRes
 
 
 @cache
-def compile_consumer(nb, delta, write, final, slots, cap, arch, deadline_ns, aux=False):
+def compile_consumer(
+    nb, delta, write, final, slots, cap, arch, deadline_ns, aux=False, capture=False
+):
     row, weight, eps = dynamic_fake(2), fake((7168,), (1,)), cutlass.Float32(1e-6)
     source = fake((slots, cap, 7168), (cap * 7168, 7168, 1)) if slots else row
     kernel = ClusterAttnRes(
@@ -31,9 +33,11 @@ def compile_consumer(nb, delta, write, final, slots, cap, arch, deadline_ns, aux
         write=write,
         final=final,
         deadline_ns=deadline_ns,
+        capture=capture,
     )
     args = (source, row, dynamic_fake(3), weight, weight, weight, row, eps, eps)
     args += (row,) * aux  # the updated prefix row, also stored to an aux stream
+    args += (row,) * capture  # the pre-norm mixture
     return cute.compile(kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}")
 
 
@@ -48,10 +52,13 @@ class PreparedAttnRes:
         self.code = self._compile(0, 0)
         self.ring: Any = None
         self.aux: Any = None
+        self.capture: Any = None
 
-    def _compile(self, slots, cap, aux=False):
+    def _compile(self, slots, cap, aux=False, capture=False):
         arch = architecture(self.device)
-        return compile_consumer(*self.key, slots, cap, arch, self.deadline_ns, aux)
+        return compile_consumer(
+            *self.key, slots, cap, arch, self.deadline_ns, aux, capture
+        )
 
     @classmethod
     def for_target(cls, target, *, deadline_ns, final=False, has_delta=True):
@@ -80,12 +87,24 @@ class PreparedAttnRes:
             ring = self._compile(slots, cap, True)
         self.aux = self._compile(0, 0, True), ring
 
-    def run_ring(self, prefix, blocks, out, aux=None):
+    def bind_capture(self):
+        """Variants that also store the pre-norm mixture this layer's input reads."""
+        ring = None
+        if self.ring is not None:
+            slots, cap = self.ring[2]
+            ring = self._compile(slots, cap, capture=True)
+        self.capture = self._compile(0, 0, capture=True), ring
+
+    def run_ring(self, prefix, blocks, out, aux=None, capture=None):
         code = self.ring[0] if aux is None else self.aux[1]
+        if capture is not None:
+            code, aux = self.capture[1], capture
         return self._launch(code, self.ring[1], prefix, blocks, out, aux)
 
-    def run(self, delta, prefix, blocks, out, aux=None):
+    def run(self, delta, prefix, blocks, out, aux=None, capture=None):
         code = self.code if aux is None else self.aux[0]
+        if capture is not None:
+            code, aux = self.capture[0], capture
         return self._launch(code, dynamic_view(delta), prefix, blocks, out, aux)
 
     def _launch(self, code, source, prefix, blocks, out, aux=None):

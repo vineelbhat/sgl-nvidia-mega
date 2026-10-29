@@ -39,6 +39,7 @@ load_activation_bf16x8 = partial(load_words, count=4, word_type="u32", mutable=T
 load_staged = partial(
     load_words, count=4, shared=True, mutable=True, result_type=Float32, word_type="f32"
 )
+load_state_bf16x4 = partial(load_words, count=2, word_type="b32")
 
 
 @asm((Float32, Int32), pure=True)
@@ -113,14 +114,32 @@ class KdaSplit:
     state comes from slot[b, accepted - 1] and token t's state goes to slot[b, t] if
     > 0; conv slot[b, 0] holds [dim, q + 2] with taps at accepted - 1 ..., rewritten to
     [c_accepted, c_accepted + 1, x_0, ..., x_q-1]. Token t's F_B row is MMA column t;
-    CTA t % C normalizes token t."""
+    CTA t % C normalizes token t.
 
-    def __init__(self, heads, batch, gate_mode, has_bias, schedule=(0, 0, 0), tokens=1):
+    ``ring`` (q > 1) is SGLang's ReplaySSM verify contract. Slots [B] name the committed
+    state and conv rows, which it reads but never writes. Token t's raw v, pre-norm k,
+    log-decay and beta go to position t of the slot's ring, and its [3, dim] conv window
+    to window[rows[b], t]. ``state_bf16``: the committed state is BF16."""
+
+    def __init__(
+        self,
+        heads,
+        batch,
+        gate_mode,
+        has_bias,
+        schedule=(0, 0, 0),
+        tokens=1,
+        ring=False,
+        state_bf16=False,
+    ):
         # The gate stage sends decays for tokens 2 * quarter + column (at most 8), while
         # the decay barrier expects 512 bytes per token: more tokens would never arrive.
         if not 1 <= tokens <= 8:
             raise ValueError(f"KdaSplit supports 1-8 tokens per request; got {tokens}")
         self.heads, self.gate_mode, self.has_bias = heads, gate_mode, has_bias
+        assert not ring or tokens > 1
+        assert not state_bf16 or not (schedule and schedule[0] >= 2)
+        self.ring, self.state_bf16 = ring, state_bf16
         early, lanes, self.occupancy, cluster, evict = (*schedule, 0, 0)[:5]
         self.early, self.staged = bool(early), early >= 2
         self.gate_staged, self.tokens = early == 3, tokens
@@ -158,6 +177,10 @@ class KdaSplit:
         if cutlass.const_expr(T == 1):
             slot = slots[token]
             conv_slot, offset, writes = slot, 0, [slot]
+        elif cutlass.const_expr(self.ring):
+            request, token = token, token * T
+            slot = slots[request]
+            conv_slot, offset, writes = slot, 0, None
         else:
             request, token = token, token * T
             offset = args[17][request] - 1
@@ -202,7 +225,10 @@ class KdaSplit:
                 if cutlass.const_expr(self.early):
                     cute.arch.cluster_arrive_relaxed()
                 coords = (head, token, value_base, lane)
-                self.gate_warp(args, shared_decay, gate_barrier, coords, gate_rows)
+                ring_g = (args[21], slot) if self.ring else None
+                self.gate_warp(
+                    args, shared_decay, gate_barrier, coords, gate_rows, ring_g
+                )
 
             if thread < 128:
                 if cutlass.const_expr(self.early):  # thread 0 arms; barrier 1 orders it
@@ -226,9 +252,16 @@ class KdaSplit:
                     if row < self.rows:
                         for j in cutlass.range_constexpr(self.chunks):
                             column = 4 * (group_lane + self.lanes_per_row * j)
-                            values = load_f32x4(state_row(row, column))
-                            for e in cutlass.range_constexpr(4):
-                                history[p, j, e] = values[e]
+                            if cutlass.const_expr(self.state_bf16):
+                                words = load_state_bf16x4(state_row(row, column))
+                                for w in cutlass.range_constexpr(2):
+                                    lo, hi = unpack_bf16(words[w])
+                                    history[p, j, 2 * w] = lo
+                                    history[p, j, 2 * w + 1] = hi
+                            else:
+                                values = load_f32x4(state_row(row, column))
+                                for e in cutlass.range_constexpr(4):
+                                    history[p, j, e] = values[e]
                 taps = zeros((3, 3), BFloat16)
                 coeff = zeros((3, 4), weights.element_type if self.early else Float32)
                 accum = zeros(3 * T, Float32)
@@ -291,6 +324,16 @@ class KdaSplit:
                     shared_q[advance(thread, 128 * t)] = q
                     shared_k[advance(thread, 128 * t)] = k
                     vs.append(v)
+                    if cutlass.const_expr(self.ring):
+                        ring_v, ring_k, ring_beta = args[19], args[20], args[22]
+                        if partition == t % self.cluster:
+                            ring_k[Int64(slot), head, t, thread] = BFloat16(k)
+                            if thread == 0:
+                                ring_beta[Int64(slot), head, t] = betas[t]
+                        if thread < self.rows:
+                            ring_v[Int64(slot), head, t, value_base + thread] = (
+                                BFloat16(v)
+                            )
                     qks += [q, k]
                     if cutlass.const_expr(t == T - 1):  # noqa: SIM102
                         if thread < self.rows:
@@ -376,18 +419,22 @@ class KdaSplit:
                                 position = self.output_position(value_base + row)
                                 dst = shared_o.iterator + position
                                 store_async_dsmem(dst, float_bits(dots[p]), bar, owner)
-                        rows = partial(state_row, s=page(writes[t]))
-                        when = None if T == 1 else writes[t] > 0
-                        self.store_rows(history, rows, (start, stop), lanes, when)
+                        if cutlass.const_expr(not self.ring):
+                            rows = partial(state_row, s=page(writes[t]))
+                            when = None if T == 1 else writes[t] > 0
+                            self.store_rows(history, rows, (start, stop), lanes, when)
                 if thread < self.rows:
                     channel = 2 * dim + value_channel
-                    window = (
-                        taps[2, 1],
-                        taps[2, 2],
-                        *(inputs[3 * t + 2] for t in range(T)),
-                    )
-                    for i, value in enumerate(window):
-                        conv_page[channel, i] = value
+                    if cutlass.const_expr(self.ring):
+                        self.store_windows(args, request, taps, inputs, 2, channel)
+                    else:
+                        window = (
+                            taps[2, 1],
+                            taps[2, 2],
+                            *(inputs[3 * t + 2] for t in range(T)),
+                        )
+                        for i, value in enumerate(window):
+                            conv_page[channel, i] = value
 
                 for t in cutlass.range_constexpr(T):
                     if partition == t % self.cluster:
@@ -407,12 +454,29 @@ class KdaSplit:
                         if cutlass.const_expr(t == 0):
                             for section in cutlass.range_constexpr(2):
                                 channel = section * dim + qk_channel
+                                if cutlass.const_expr(self.ring):
+                                    self.store_windows(
+                                        args, request, taps, inputs, section, channel
+                                    )
+                                    continue
                                 window = (taps[section, 1], taps[section, 2])
                                 window += tuple(
                                     inputs[3 * u + section] for u in range(T)
                                 )
                                 for i, value in enumerate(window):
                                     conv_page[channel, i] = value
+
+    @cute.jit
+    def store_windows(self, args, request, taps, inputs, section, channel):
+        """Token t's conv window [3, dim]: inputs t + 1 .. t + 3 of the taps and the
+        step's inputs, at window[rows[request], t, :, channel]."""
+        T: cutlass.Constexpr = self.tokens
+        windows, row = args[18], args[17][request]
+        sequence = [taps[section, i] for i in range(3)]
+        sequence += [inputs[3 * u + section] for u in range(T)]
+        for t in cutlass.range_constexpr(T):
+            for i in cutlass.range_constexpr(3):
+                windows[row, t, i, channel] = sequence[t + 1 + i]
 
     @cute.jit
     def store_rows(self, history, state_row, span, lanes, when=None):
@@ -473,7 +537,7 @@ class KdaSplit:
                 dots[p] += cute.arch.shuffle_sync_bfly(dots[p], 1 << shift)
 
     @cute.jit
-    def gate_warp(self, args, shared_decay, barrier, coords, staged_rows):
+    def gate_warp(self, args, shared_decay, barrier, coords, staged_rows, ring_g=None):
         """Project one value partition and multicast its decays to every CTA. Modes fix
         the F_B reduction order: 0 = one chain of eight MMAs, 1 = four chains of two,
         2 = sixteen 8-FMA partials summed in a butterfly. Projection math stays IEEE.
@@ -584,7 +648,7 @@ class KdaSplit:
             if cutlass.const_expr(self.tokens > 1):
                 gates = (a, lower_bound, dt, features)
                 targets = (shared_decay, barrier, value_base)
-                return self.multicast(acc, gates, targets, lane)
+                return self.multicast(acc, gates, targets, lane, (head, ring_g))
             raw_g = []
             for r in cutlass.range_constexpr(per):
                 partial = cute.make_rmem_tensor(chains, Float32)
@@ -645,9 +709,10 @@ class KdaSplit:
         store_async_dsmem(pointer, words, barrier, destination)
 
     @cute.jit
-    def multicast(self, acc, gates, targets, lane):
+    def multicast(self, acc, gates, targets, lane, ring=(None, None)):
         """Decays (q > 1) of the lane's D fragments (feature rows, token columns 2
-        quarter + {0, 1}) to every CTA's shared [token, 128] decays."""
+        quarter + {0, 1}) to every CTA's shared [token, 128] decays. With ``ring``, (head,
+        (log-decay ring, slot)), it also stores the log-decays."""
         (a, lower_bound, dt, features), (shared_decay, barrier, value_base) = (
             gates,
             targets,
@@ -665,13 +730,18 @@ class KdaSplit:
                 raw_g = Float32(BFloat16(value))
                 gate = cute.math.exp(a, fastmath=True) * (raw_g + dt[i])
                 gate = sigmoid(gate, self.fast_math)
-                decay = float_bits(cute.math.exp(lower_bound * gate, fastmath=True))
+                log_decay = lower_bound * gate
+                decay = float_bits(cute.math.exp(log_decay, fastmath=True))
                 token = 2 * quarter + column
                 offset = token * 128 + value_base + features[i]
                 pointer = shared_decay.iterator + offset
                 if token < self.tokens:
                     for rank in cutlass.range_constexpr(self.cluster):
                         store_async_dsmem(pointer, decay, barrier, rank)
+                    if cutlass.const_expr(self.ring):
+                        head, (ring_g, slot) = ring
+                        feature = value_base + features[i]
+                        ring_g[Int64(slot), head, token, feature] = log_decay
 
     @staticmethod
     def split_pairs(wr, tile, chunk, low, high):

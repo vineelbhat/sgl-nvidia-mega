@@ -13,6 +13,7 @@ every context.
                sources, then W_UV and the gate (padding from the global lengths)
 """
 
+import inspect
 import math
 from functools import cache
 
@@ -329,6 +330,10 @@ def stock_decode(
             )
         bound = max(size, sms * heads * 513 * 4)
         _WORKSPACE[key] = torch.empty(bound, dtype=torch.int8, device=device)
+    # tokenspeed-mla 2.0.3 takes has_local_visible_lens; earlier versions do not.
+    visible = {}
+    if "has_local_visible_lens" in inspect.signature(md._get_compiled_mla_kernel).parameters:
+        visible = {"has_local_visible_lens": False}
     kernel = md._get_compiled_mla_kernel(
         torch_dtype=fp8,
         page_size=cache.shape[1],
@@ -338,6 +343,7 @@ def stock_decode(
         is_var_seq=True,
         is_var_split_kv=False,
         compute_capability=arch,
+        **visible,
         skip_correction_threshold=8.0,
         is_workspace_size_zero=size == 0,
         fold_sq_factor=fold,
